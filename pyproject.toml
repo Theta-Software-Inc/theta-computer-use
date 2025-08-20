@@ -1,0 +1,30 @@
+[project]
+name = "theta-sdk"
+version = "0.1.0"
+description = "Theta Testing Engine SDK"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.9, <3.14"
+authors = [
+    {name = "Theta Team", email = "founders@thetasoftware.ai"}
+]
+dependencies = [
+    "httpx>=0.24.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "openai>=1.0.0",
+    "Pillow>=10.0.0",
+    "python-dotenv>=1.0.0"
+]
+
+[project.optional-dependencies]
+examples = [
+    "python-dotenv>=1.0.0"
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["theta"]
