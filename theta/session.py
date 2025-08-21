@@ -54,8 +54,7 @@ class Session:
             url, 
             "POST", 
             api_key=settings.api_key, 
-            data=request.model_dump(),
-            timeout=200.0
+            data=request.model_dump()
         )
         
         # Create Environment objects directly from API response

@@ -19,10 +19,10 @@ async def main():
     print("Available tasks: ", tasks)
 
     print("Creating environment...")
-    env = await session.create_environment(tasks[0])
+    env = await session.create_environment("re-model")
     vnc_url = await env.get_vnc_url()
     print(f"Environment created with task: {env.task_id}, VNC available at {vnc_url}")
-
+    input("Press Enter to continue...")
     agent = OpenAIAgent(
         name="cua",
         api_key=dotenv.get_key(".env", "OPENAI_API_KEY"),
