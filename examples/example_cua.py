@@ -5,7 +5,7 @@ import asyncio
 
 
 async def main():
-    client = Client()
+    client = Client(api_key=dotenv.get_key(".env", "THETA_API_KEY"))
     print("Closing any stale environments...")
     await client.close_all_environments()
     sessions = await client.get_sessions()
