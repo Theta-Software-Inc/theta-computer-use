@@ -9,6 +9,7 @@ authors = [
     {name = "Theta Team", email = "founders@thetasoftware.ai"}
 ]
 dependencies = [
+    "anthropic>=0.65.0",
     "httpx>=0.24.0",
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",

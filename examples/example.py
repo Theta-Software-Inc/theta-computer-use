@@ -19,12 +19,12 @@ async def main():
     print("Available tasks: ", tasks)
 
     print("Creating environment...")
-    env = await session.create_environment("re-model")
+    env = await session.create_environment("accounting-dilution")
     vnc_url = await env.get_vnc_url()
     print(f"Environment created with task: {env.task_id}, VNC available at {vnc_url}")
     input("Press Enter to continue...")
     agent = OpenAIAgent(
-        name="cua",
+        name="openai",
         api_key=dotenv.get_key(".env", "OPENAI_API_KEY"),
         model="computer-use-preview",
         screen_size=(1024, 768),
@@ -32,15 +32,13 @@ async def main():
 
     print("Starting OpenAI CUA agent loop")
     obs = env.current_obs
-    for step in range(5):
-        print(f"Step {step + 1}: Agent is analyzing the screen...")
-        action, done = agent.act(obs)
+    for _ in range(20):
+        action, done = await agent.act(obs)
         
         if action is None or done:
             print("Agent finished or failed to find an action")
             break
             
-        print(f"Agent taking action: {type(action).__name__}")
         obs, reward, finished, info = await env.step(action)
         
         if finished:
@@ -51,16 +49,8 @@ async def main():
     run = await env.evaluate()
     print(f"Evaluation score: {run.score}")
 
-    print("Saving agent trajectory with evaluation score...")
-    
-    # Save trajectory with images as separate PNG files, including eval score
-    trajectory_file = agent.trajectory_json(save_images=True, eval_score=run.score)
-    print(f"✅ Trajectory JSON saved to: {trajectory_file}")
-    
-    # Generate HTML viewer for easy browsing, including eval score
-    html_viewer = agent.trajectory_html_viewer(eval_score=run.score)
-    print(f"🌐 HTML viewer generated: {html_viewer}")
-    print("💡 Open the HTML file in your browser to view screenshots and trajectory details")
+    agent.trajectory_json(save_images=True, eval_score=run.score)
+    agent.trajectory_html_viewer(eval_score=run.score)
     
     await env.close()
     print("Environment closed")

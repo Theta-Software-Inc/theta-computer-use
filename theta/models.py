@@ -27,8 +27,6 @@ class EnvRef(BaseModel):
     status: EnvStatus
 
 
-
-
 class StepEnvResponse(BaseModel):
     observation: Observation
     reward: float
@@ -48,7 +46,8 @@ class Key(BaseModel):
 
 
 class ClickAction(BaseModel):
-    type: Literal["click", "double_click"] = "click"
+    # add triple_click
+    type: Literal["click", "double_click", "triple_click"] = "click"
     point: Optional[Point] = None
     button: Literal["left", "right", "middle"] = "left"
 
@@ -56,6 +55,7 @@ class ClickAction(BaseModel):
 class ScrollAction(BaseModel):
     type: Literal["scroll"] = Field(default="scroll")
     point: Optional[Point] = None
+    # dx -> horizontal (right positive), dy -> vertical (up positive)
     scroll_delta: Point
 
 
@@ -66,6 +66,7 @@ class MoveAction(BaseModel):
 
 class DragAction(BaseModel):
     type: Literal["drag"] = Field(default="drag")
+    # If only 1 point is provided, executors may drag from current cursor to that point
     path: List[Point]
 
 
@@ -79,6 +80,28 @@ class KeyPressAction(BaseModel):
     keys: List[Key]
 
 
+# Claude-only fine-grained mouse and hold
+class MouseDownAction(BaseModel):
+    type: Literal["mouse_down"] = Field(default="mouse_down")
+    button: Literal["left", "right", "middle"] = "left"
+    point: Optional[Point] = None
+
+class MouseUpAction(BaseModel):
+    type: Literal["mouse_up"] = Field(default="mouse_up")
+    button: Literal["left", "right", "middle"] = "left"
+    point: Optional[Point] = None
+
+class HoldKeyAction(BaseModel):
+    type: Literal["hold_key"] = Field(default="hold_key")
+    keys: List[Key]
+    duration: float = 0.3  # seconds
+
+
+# Explicit screenshot action (no pyautogui; controller captures)
+class ScreenshotAction(BaseModel):
+    type: Literal["screenshot"] = Field(default="screenshot")
+
+
 Action = Annotated[
     Union[
         ClickAction,
@@ -87,6 +110,10 @@ Action = Annotated[
         DragAction,
         TypeAction,
         KeyPressAction,
+        MouseDownAction,
+        MouseUpAction,
+        HoldKeyAction,
+        ScreenshotAction,
     ],
     Field(discriminator="type"),
 ]

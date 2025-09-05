@@ -1,4 +1,4 @@
-# openai_cua.py
+# claude_cua.py
 from __future__ import annotations
 
 import base64
@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from PIL import Image
-from openai import AsyncOpenAI
+from anthropic import AsyncAnthropic
 
 from theta.models import (
     Observation,
@@ -22,56 +22,81 @@ from theta.models import (
     DragAction,
     TypeAction,
     KeyPressAction,
+    MouseDownAction,
+    MouseUpAction,
+    HoldKeyAction,
     Point,
     Key,
 )
 
 
-class OpenAIAgent:
+class ClaudeAgent:
     """
-    OpenAI Computer Use (Responses API) agent.
+    Anthropic Claude Computer Use agent (computer_20250124 by default).
 
     Key points:
-    - Uses the Responses API with the `computer_use_preview` tool.
-    - Handles `screenshot` and `wait` inline by replying with `computer_call_output` that
-      contains a fresh `input_image` data URL.
-    - Translates only the documented OpenAI action set:
-        click, double_click, move, scroll, drag, type, keypress
-      (screenshot/wait are handled inline and not translated to universal actions).
-    - Scroll deltas (scroll_x / scroll_y) are treated as wheel units (not pixels):
-        vertical: + = up, - = down
-        horizontal: + = right, - = left
+    - Uses Messages API with the `computer_2025-01-24` (or 2024-10-22) tool.
+    - Handles `screenshot` and `wait` inline by replying with a `tool_result`
+      that contains a fresh image block (base64).
+    - Translates the documented Claude action space:
+        left_click, right_click, middle_click, double_click, triple_click,
+        mouse_move, type, key, scroll (direction+amount),
+        left_click_drag, left_mouse_down, left_mouse_up, hold_key
+      (screenshot/wait handled inline).
+    - For `scroll`: `scroll_amount` is a *number of wheel steps* (not pixels).
       -> We DO NOT scale the amount, but we DO scale the target coordinate x,y.
-    - Captures all available reasoning items and stores them in the trajectory.
+    - Captures all thinking / redacted_thinking blocks and stores them in the trajectory.
     """
 
     def __init__(
         self,
         name: str,
         api_key: str,
-        model: str = "computer-use-preview",
+        model: str = "claude-4-sonnet-20250514",
         screen_size: tuple[int, int] = (1024, 768),
         *,
+        tool_version: str = "20250124",
+        display_number: int = 1,
+        max_tokens: int = 20000,
+        enable_thinking: bool = True,
         enable_logging: bool = True,
         logger: Optional[logging.Logger] = None,
     ):
         self.name = name
-        self.openai_client = AsyncOpenAI(api_key=api_key)
+        self.client = AsyncAnthropic(api_key=api_key)
         self.model = model
         self.width, self.height = screen_size
+        self.max_tokens = max_tokens
 
-        self._prev_response_id: Optional[str] = None
-        self._pending_call_id: Optional[str] = None
-        self._pending_safety: List[Dict[str, Any]] = []
+        self._tool_type = f"computer_{tool_version}"
+        self._betas = ["computer-use-2025-01-24"] if tool_version == "20250124" else ["computer-use-2024-10-22"]
+        self._tools = [{
+            "type": self._tool_type,
+            "name": "computer",
+            "display_width_px": self.width,
+            "display_height_px": self.height,
+            "display_number": display_number,
+        }]
+        self._thinking = {"type": "enabled", "budget_tokens": 10000} if enable_thinking else None
+
+        self._system_prompt = (
+            "You are a computer-use agent. Do not ask questions or wait for clarification. "
+            "Use the computer tool autonomously until the task is complete. "
+            "If you finish or cannot proceed further, end your response with 'done' or 'fail' without requesting more tools."
+        )
+
+        self._messages: List[Dict[str, Any]] = []
+        self._pending_tool_use_id: Optional[str] = None
+        self._pending_action_name: Optional[str] = None
+
         self._sx: float = 1.0
         self._sy: float = 1.0
 
-        # Trajectory tracking
         self._trajectory: List[Dict[str, Any]] = []
         self._step_count: int = 0
         self._session_start_time = datetime.now().isoformat()
         self._enable_logging = enable_logging
-        self.logger = logger or logging.getLogger("theta.agents.openai")
+        self.logger = logger or logging.getLogger("theta.agents.claude")
         if self._enable_logging:
             self.logger.setLevel(logging.INFO)
             if not self.logger.handlers:
@@ -80,55 +105,35 @@ class OpenAIAgent:
                 self.logger.addHandler(_h)
             self.logger.propagate = False
 
-        self._system_prompt = (
-            "You are a computer-use agent. Do not ask questions or wait for clarification. "
-            "Use the computer tool autonomously until the task is complete. "
-            "If you finish or cannot proceed further, end your response with 'done' or 'fail' without issuing a computer_call."
-        )
-
-        self._tools = [{
-            "type": "computer_use_preview",
-            "display_width": self.width,
-            "display_height": self.height,
-            # environment: "linux"|"windows"|"mac" – either is fine for display-only flows
-            "environment": "linux",
-        }]
-
-        # Ask the API to include a concise reasoning summary where available
-        self._reasoning = {"summary": "auto"}
-
     # --------------------------- public API ---------------------------
 
     async def act(self, obs: Observation) -> tuple[Optional[Action], bool]:
         """
         Step the agent once with the given observation.
         Returns (Action, done).
-        - If 'done' is True, there is no Action to execute (model ended or waiting).
-        - If 'done' is False, execute the Action and then call act() again with the new obs.
         """
         self._step_count += 1
         step_start_time = datetime.now().isoformat()
         scaled = self.rescale(obs)
 
-        # Initialize step data for trajectory
         step_data = {
             "step": self._step_count,
             "timestamp": step_start_time,
             "observation": {
                 "text": obs.text,
-                "screenshot": obs.screenshot,   # original base64 you provided
-                "screenshot_size": None
+                "screenshot": obs.screenshot,
+                "screenshot_size": None,
             },
             "reasoning": None,
-            "reasoning_blocks": [],  # raw blocks
+            "reasoning_blocks": [],  # raw thinking blocks
             "assistant_text": None,
             "tool_call": None,
-            "tool_call_raw": None,   # full raw call object
+            "tool_call_raw": None,
             "action_taken": None,
-            "done": False
+            "done": False,
         }
 
-        # Capture original screenshot size
+        # record original screenshot size
         if obs.screenshot:
             try:
                 b64 = obs.screenshot.split(",", 1)[-1] if obs.screenshot.startswith("data:") else obs.screenshot
@@ -138,166 +143,129 @@ class OpenAIAgent:
                 pass
 
         for attempt in range(12):
-            inputs: List[Dict[str, Any]] = []
-
-            # First turn: send the instruction as a user message
-            if self._prev_response_id is None:
-                user_content = obs.text or "Complete the task on screen."
-                inputs.append({"type": "message", "role": "user", "content": user_content})
-
-            # If we owe a screenshot from a prior computer_call, send it now
-            elif self._pending_call_id:
+            # If we owe a tool_result (screenshot), send it now
+            if self._pending_tool_use_id:
                 if not scaled.screenshot:
-                    # no image available => end gracefully
                     step_data["done"] = True
                     self._trajectory.append(step_data)
                     return None, True
+                tool_result_block = self._make_tool_result_block(
+                    self._pending_tool_use_id,
+                    base64_png=scaled.screenshot,
+                    note=f"Result after '{self._pending_action_name or 'action'}'",
+                )
+                self._append_user_message([tool_result_block])
+                self._pending_tool_use_id = None
+                self._pending_action_name = None
 
-                item: Dict[str, Any] = {
-                    "type": "computer_call_output",
-                    "call_id": self._pending_call_id,
-                    "output": {
-                        "type": "input_image",
-                        # OpenAI supports data URLs for image_url
-                        "image_url": f"data:image/png;base64,{scaled.screenshot}",
-                    },
-                }
-                if self._pending_safety:
-                    item["acknowledged_safety_checks"] = self._pending_safety
-                inputs.append(item)
-                self._pending_call_id = None
-                self._pending_safety = []
+            # First turn: send the initial screenshot + instruction
+            if not self._messages:
+                user_text = obs.text or "Complete the task on screen."
+                # Use an image block plus text block, mirroring the quickstarts
+                init_blocks = []
+                if scaled.screenshot:
+                    init_blocks.append({
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/png", "data": scaled.screenshot}
+                    })
+                init_blocks.append({"type": "text", "text": user_text})
+                self._append_user_message(init_blocks)
 
-            # Ask the model to proceed
-            resp = await self.openai_client.responses.create(
-                model=self.model,
-                input=inputs,
-                tools=self._tools,
-                previous_response_id=self._prev_response_id,
-                reasoning=self._reasoning,
-                truncation="auto",
-                instructions=self._system_prompt,
-            )
-            self._prev_response_id = getattr(resp, "id", None)
+            params: Dict[str, Any] = {
+                "model": self.model,
+                "max_tokens": self.max_tokens,
+                "messages": self._messages,
+                "tools": self._tools,
+                "betas": self._betas,
+                "system": self._system_prompt,
+                "tool_choice": {"type": "auto", "disable_parallel_tool_use": True},
+            }
+            if self._thinking:
+                params["thinking"] = self._thinking
 
-            # ------ capture reasoning / thinking ------
-            output = getattr(resp, "output", None) or []
+            resp = await self.client.beta.messages.create(**params)
+            self._append_assistant_message(resp.content)
 
-            # Raw reasoning blocks (from output items)
-            rblocks: List[Any] = []
-            try:
-                for it in output:
-                    if getattr(it, "type", None) == "reasoning":
-                        rblocks.append(self._serialize_object(it))
-                    elif getattr(it, "type", None) == "message" and hasattr(it, "reasoning") and it.reasoning:
-                        rblocks.append(self._serialize_object(it.reasoning))
-            except Exception:
-                pass
+            # ------ capture thinking / redacted_thinking ------
+            thinking_blocks = self._collect_thinking_blocks(resp.content)
+            step_data["reasoning_blocks"] = thinking_blocks
+            step_data["reasoning"] = self._join_thinking_text(thinking_blocks) or "No reasoning available"
 
-            # Human-readable reasoning summary if present
-            reasoning_text = None
-            if hasattr(resp, 'reasoning') and resp.reasoning:
-                try:
-                    # 'summary' may be a list of segments with a .text field
-                    summ = getattr(resp.reasoning, "summary", None)
-                    if isinstance(summ, list) and summ:
-                        maybe = getattr(summ[0], "text", None) or getattr(summ[0], "content", None)
-                        if maybe:
-                            reasoning_text = str(maybe)
-                except Exception:
-                    pass
-
-            if not reasoning_text and rblocks:
-                # fallback: find a 'text'/'content' within blocks
-                for rb in rblocks:
-                    if isinstance(rb, dict):
-                        text = rb.get("text") or rb.get("content")
-                        if text:
-                            reasoning_text = str(text)
-                            break
-
-            step_data["reasoning_blocks"] = rblocks
-            step_data["reasoning"] = reasoning_text or "No reasoning available"
-
-            # Assistant text outputs (human-readable)
+            # Assistant text blocks (human-readable)
             texts: List[str] = []
             try:
-                for it in output:
-                    if getattr(it, "type", None) == "message":
-                        content = getattr(it, "content", []) or []
-                        if isinstance(content, list):
-                            for seg in content:
-                                if isinstance(seg, dict) and seg.get("type") in ("output_text", "text"):
-                                    txt = seg.get("text")
-                                    if txt:
-                                        texts.append(str(txt))
+                for b in resp.content or []:
+                    if self._safe_attr(b, "type") == "text":
+                        t = self._safe_attr(b, "text")
+                        if t:
+                            texts.append(str(t))
             except Exception:
                 pass
             step_data["assistant_text"] = "\n".join(texts) if texts else None
 
-            # ------ find and handle computer calls ------
-            calls = [it for it in output if getattr(it, "type", None) == "computer_call"]
-            if not calls:
-                # model ended or produced only text
+            # ------ find computer tool_use ------
+            tool_uses = [b for b in (resp.content or []) if self._safe_attr(b, "type") == "tool_use" and self._safe_attr(b, "name") == "computer"]
+            if not tool_uses:
                 step_data["done"] = True
                 self._trajectory.append(step_data)
                 self._log_step(step_data)
                 return None, True
 
-            call = calls[0]
-            self._pending_call_id = getattr(call, "call_id", None)
-            self._pending_safety = getattr(call, "pending_safety_checks", []) or []
-            action = getattr(call, "action", {}) or {}
-            a_type = str(getattr(action, "type", "")).lower()
+            tu = tool_uses[0]
+            tu_id = self._safe_attr(tu, "id")
+            tu_input = self._safe_attr(tu, "input") or {}
+            a_type = str(tu_input.get("action", "")).lower()
 
-            # record exact tool call for debugging/auditing
             step_data["tool_call"] = {
-                "call_id": self._pending_call_id,
+                "tool_use_id": tu_id,
                 "action_type": a_type,
-                "action_data": self._serialize_object(action),
-                "attempt": attempt + 1
+                "action_data": self._serialize_object(tu_input),
+                "attempt": attempt + 1,
             }
-            step_data["tool_call_raw"] = self._serialize_object(call)
+            step_data["tool_call_raw"] = self._serialize_object(tu)
 
-            # 'screenshot' and 'wait' are handled by sending a fresh image next loop
+            # screenshot / wait → reply with a fresh image (tool_result)
             if a_type in ("screenshot", "wait"):
+                if not scaled.screenshot:
+                    step_data["done"] = True
+                    self._trajectory.append(step_data)
+                    self._log_step(step_data)
+                    return None, True
+                tool_result_block = self._make_tool_result_block(tu_id, base64_png=scaled.screenshot, note=a_type)
+                self._append_user_message([tool_result_block])
                 continue
 
             # translate to universal Action
-            ua = self.translate(action)
+            self._pending_tool_use_id = tu_id
+            self._pending_action_name = a_type
+
+            ua = self.translate(tu_input)
 
             step_data["action_taken"] = {
-                "type": getattr(ua, 'type', type(ua).__name__),
-                "parameters": self._serialize_object(ua)
+                "type": getattr(ua, "type", type(ua).__name__),
+                "parameters": self._serialize_object(ua),
             }
             step_data["done"] = False
             self._trajectory.append(step_data)
             self._log_step(step_data)
             return ua, False
 
-        # Exhausted attempts without a concrete action
         step_data["done"] = True
         self._trajectory.append(step_data)
         self._log_step(step_data)
         return None, True
 
     def trajectory_json(self, output_dir: str = "trajectories", save_images: bool = True, eval_score: Optional[float] = None) -> str:
-        """
-        Save the full trajectory to disk; optionally export screenshots to files.
-        """
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
-
         session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         uniq = uuid.uuid4().hex[:6]
         session_dir = os.path.join(output_dir, f"{self.name}_trajectory_{session_timestamp}-{uniq}")
         if not os.path.exists(session_dir):
             os.makedirs(session_dir)
-
         images_dir = os.path.join(session_dir, "images")
         if save_images and not os.path.exists(images_dir):
             os.makedirs(images_dir)
-
         filename = f"{self.name}_trajectory.json"
         filepath = os.path.join(session_dir, filename)
 
@@ -340,10 +308,10 @@ class OpenAIAgent:
             "images_saved": save_images,
             "images_directory": "images/" if save_images else None,
             "session_directory": session_dir,
-            "trajectory": processed_trajectory
+            "trajectory": processed_trajectory,
         }
 
-        with open(filepath, 'w', encoding='utf-8') as f:
+        with open(filepath, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
 
         steps_count = len(processed_trajectory)
@@ -352,16 +320,15 @@ class OpenAIAgent:
         return filepath
 
     def trajectory_html_viewer(self, output_dir: str = "trajectories", eval_score: Optional[float] = None) -> str:
-        """
-        Generate a simple HTML viewer (kept identical across agents for parity).
-        """
+        # Same viewer as OpenAI for parity
         if hasattr(self, '_current_session_dir') and self._current_session_dir:
             session_dir = self._current_session_dir
         else:
             if not os.path.exists(output_dir):
                 os.makedirs(output_dir)
-            session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            session_dir = os.path.join(output_dir, f"{self.name}_trajectory_{session_timestamp}")
+            session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            uniq = uuid.uuid4().hex[:6]
+            session_dir = os.path.join(output_dir, f"{self.name}_trajectory_{session_timestamp}-{uniq}")
             if not os.path.exists(session_dir):
                 os.makedirs(session_dir)
 
@@ -427,7 +394,6 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans
       </div>
 """
 
-            # Text Output (assistant text) – only render if present
             if step.get('assistant_text'):
                 html_content += f"""
       <div>
@@ -473,144 +439,215 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans
 </html>
 """
 
-        with open(html_path, 'w', encoding='utf-8') as f:
+        with open(html_path, 'w', encoding="utf-8") as f:
             f.write(html_content)
 
         print(f"📱 Open in browser: file://{os.path.abspath(html_path)}")
         return html_path
 
     def clear_trajectory(self):
-        """Clear current trajectory data."""
         self._trajectory = []
         self._step_count = 0
         self._session_start_time = datetime.now().isoformat()
-        if hasattr(self, '_current_session_dir'):
-            delattr(self, '_current_session_dir')
+        if hasattr(self, "_current_session_dir"):
+            delattr(self, "_current_session_dir")
+        self._messages = []
+        self._pending_tool_use_id = None
+        self._pending_action_name = None
         print("🧹 Trajectory cleared")
 
     # --------------------------- helpers ---------------------------
 
+    def _append_user_message(self, blocks: List[Dict[str, Any]]):
+        self._messages.append({"role": "user", "content": blocks})
+
+    def _append_assistant_message(self, blocks: Any):
+        self._messages.append({"role": "assistant", "content": blocks})
+
+    def _make_tool_result_block(self, tool_use_id: str, *, base64_png: Optional[str], note: str = "") -> Dict[str, Any]:
+        blocks: List[Dict[str, Any]] = []
+        if note:
+            blocks.append({"type": "text", "text": note})
+        if base64_png:
+            blocks.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": base64_png}
+            })
+        return {"type": "tool_result", "tool_use_id": tool_use_id, "content": blocks}
+
     def rescale(self, obs: Observation) -> Observation:
-        """
-        Resize the screenshot to the tool display size for the model,
-        and set sx/sy so model coordinates can be mapped back.
-        """
         if not obs or not obs.screenshot:
             return obs
-
         b64 = obs.screenshot.split(",", 1)[-1] if obs.screenshot.startswith("data:") else obs.screenshot
         img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGBA")
         ow, oh = img.size
-
         # mapping from tool display coords -> original pixels
         self._sx = (ow / float(self.width)) if self.width else 1.0
         self._sy = (oh / float(self.height)) if self.height else 1.0
-
         if (ow, oh) != (self.width, self.height):
             img = img.resize((self.width, self.height), Image.LANCZOS)
-
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         out_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
         return Observation(screenshot=out_b64, text=obs.text)
 
-    def translate(self, action: Any) -> Action:
+    def translate(self, action_input: Dict[str, Any]) -> Action:
         """
-        Translate OpenAI CUA computer_call.action into a theta Action.
-        Only the documented OpenAI action space is supported.
+        Translate Claude tool_use.input into a theta Action.
         """
-        t = str(getattr(action, "type", "")).lower()
+        t = str(action_input.get("action", "")).lower()
 
-        def v(name: str, default=None):
-            return getattr(action, name, default)
-
-        def map_xy(x: float, y: float) -> Tuple[float, float]:
-            # scale from tool display space -> original pixels
+        def map_xy_xylist(val) -> Tuple[float, float]:
+            if isinstance(val, (list, tuple)) and len(val) >= 2:
+                x, y = val[0], val[1]
+            elif isinstance(val, dict):
+                x, y = val.get("x", 0), val.get("y", 0)
+            else:
+                x, y = 0, 0
             return float(x) * self._sx, float(y) * self._sy
 
-        if t in ("click", "left_click"):
-            x, y = map_xy(v("x", 0), v("y", 0))
-            return ClickAction(type="click", point=Point(x=x, y=y), button=v("button", "left"))
+        def map_coord() -> Tuple[float, float]:
+            return map_xy_xylist(action_input.get("coordinate", [0, 0]))
 
-        if t == "double_click":
-            x, y = map_xy(v("x", 0), v("y", 0))
-            return ClickAction(type="double_click", point=Point(x=x, y=y), button=v("button", "left"))
+        # Clicks (Claude supports more variants)
+        if t in ("left_click", "right_click", "middle_click", "double_click", "triple_click"):
+            x, y = map_coord()
+            button = "left"
+            click_type = "click"
+            if t == "right_click":
+                button = "right"
+            elif t == "middle_click":
+                button = "middle"
+            elif t == "double_click":
+                click_type = "double_click"
+            elif t == "triple_click":
+                click_type = "triple_click"
+            return ClickAction(type=click_type, point=Point(x=x, y=y), button=button)
 
-        if t in ("move", "mouse_move"):
-            x, y = map_xy(v("x", 0), v("y", 0))
+        if t == "mouse_move":
+            x, y = map_coord()
             return MoveAction(type="move", point=Point(x=x, y=y))
 
+        if t == "type":
+            return TypeAction(type="type_text", text=str(action_input.get("text", "")))
+
+        if t == "key":
+            combo = str(action_input.get("text", "") or action_input.get("keys", "") or action_input.get("key", ""))
+            parts = [p.strip() for p in combo.split("+")] if combo else []
+            keys = [Key(key=p) for p in parts if p]
+            return KeyPressAction(type="key_press", keys=keys if keys else ([Key(key=combo)] if combo else []))
+
+        # Scroll: direction + amount (wheel steps). No scaling of amount.
         if t == "scroll":
-            # Treat scroll_x/scroll_y as wheel units (no scaling of amount).
-            # Scale only the target coordinate. Engine expects down as negative.
-            x, y = map_xy(v("x", 0), v("y", 0))
-            dx = int(v("scroll_x", 0) or 0)
-            dy_raw = int(v("scroll_y", 0) or 0)
-            dy = -dy_raw
+            x, y = map_coord()
+            dx = dy = 0
+            if "scroll_direction" in action_input and "scroll_amount" in action_input:
+                direction = str(action_input.get("scroll_direction", "down")).lower()
+                amt = int(action_input.get("scroll_amount", 1) or 1)
+                if amt < 0:
+                    amt = -amt
+                if direction in ("up", "down"):
+                    dy = +amt if direction == "up" else -amt
+                elif direction in ("right", "left"):
+                    dx = +amt if direction == "right" else -amt
+            else:
+                # Rare: pixel-like deltas; treat as wheel units directly (no scaling)
+                dx = int(action_input.get("scroll_x", 0) or 0)
+                dy = int(action_input.get("scroll_y", 0) or 0)
             return ScrollAction(type="scroll", point=Point(x=x, y=y), scroll_delta=Point(x=dx, y=dy))
 
-        if t == "drag":
+        # Drag: left_click_drag (start_coordinate optional) -> path
+        if t == "left_click_drag":
             pts: List[Point] = []
-            for p in (v("path", []) or []):
-                if isinstance(p, dict):
-                    px, py = p.get("x", 0), p.get("y", 0)
-                elif hasattr(p, 'x') and hasattr(p, 'y'):
-                    px, py = getattr(p, 'x', 0), getattr(p, 'y', 0)
-                elif isinstance(p, (list, tuple)) and len(p) >= 2:
-                    px, py = p[0], p[1]
+
+            def to_point(val):
+                if isinstance(val, (list, tuple)) and len(val) >= 2:
+                    xx, yy = float(val[0]), float(val[1])
+                elif isinstance(val, dict):
+                    xx, yy = float(val.get("x", 0)), float(val.get("y", 0))
                 else:
-                    px = getattr(p, 'x', 0) if hasattr(p, 'x') else 0
-                    py = getattr(p, 'y', 0) if hasattr(p, 'y') else 0
-                mx, my = map_xy(px, py)
-                pts.append(Point(x=mx, y=my))
+                    return None
+                return Point(x=xx * self._sx, y=yy * self._sy)
+
+            if "start_coordinate" in action_input:
+                p = to_point(action_input["start_coordinate"])
+                if p:
+                    pts.append(p)
+            if "coordinate" in action_input:
+                p = to_point(action_input["coordinate"])
+                if p:
+                    pts.append(p)
+            if not pts and "path" in action_input and isinstance(action_input["path"], (list, tuple)):
+                for node in action_input["path"]:
+                    p = to_point(node)
+                    if p:
+                        pts.append(p)
             if not pts:
-                raise NotImplementedError("drag requires at least one point")
+                raise NotImplementedError("left_click_drag requires at least an end coordinate.")
             return DragAction(type="drag", path=pts)
 
-        if t == "type":
-            return TypeAction(type="type_text", text=str(v("text", "")))
-
-        if t == "keypress":
-            keys = [Key(key=str(k)) for k in (v("keys", []) or [])]
-            return KeyPressAction(type="key_press", keys=keys)
-
-        # OpenAI CUA does not include triple_click / left_mouse_* / hold_key in its set
-        if t in ("triple_click", "left_mouse_down", "left_mouse_up", "hold_key"):
-            raise NotImplementedError(f"Unsupported OpenAI action: {t}")
+        # Fine-grained mouse + hold (Claude-only)
+        if t in ("left_mouse_down", "mouse_down"):
+            x, y = map_coord()
+            return MouseDownAction(button="left", point=Point(x=x, y=y))
+        if t in ("left_mouse_up", "mouse_up"):
+            x, y = map_coord()
+            return MouseUpAction(button="left", point=Point(x=x, y=y))
+        if t == "hold_key":
+            combo = str(action_input.get("text", "") or action_input.get("key", "")).strip()
+            parts = [p.strip() for p in combo.split("+")] if combo else []
+            keys = [Key(key=p) for p in parts if p]
+            dur = float(action_input.get("duration", 0.5))
+            return HoldKeyAction(keys=keys, duration=dur)
 
         if t in ("screenshot", "wait"):
-            # handled in act() by sending a screenshot; never translated here
+            # handled inline in act() by sending tool_result with a fresh image
             raise NotImplementedError(f"Internal-only action surfaced to translate(): {t}")
+
+        # OpenAI-specific action shape not valid here
+        if t == "drag":
+            raise NotImplementedError("Unsupported Claude action: drag")
 
         raise NotImplementedError(f"Unhandled action type: {t}")
 
-    async def get_response(self, prompt: str) -> str:
-        """
-        Convenience method for a one-off text reply (rarely used in CUA runs).
-        """
-        r = await self.openai_client.responses.create(
-            model=self.model,
-            input=[{"type": "message", "role": "user", "content": prompt}],
-            tools=self._tools,
-            reasoning=self._reasoning,
-            truncation="auto",
-            instructions=self._system_prompt,
-        )
-        for item in getattr(r, "output", []) or []:
-            if getattr(item, "type", None) == "message":
-                content = getattr(item, "content", []) or []
-                if content and isinstance(content, list):
-                    seg = content[0]
-                    if isinstance(seg, dict) and seg.get("type") in ("output_text", "text"):
-                        return seg.get("text", "")
-        return ""
-
     # --------------------------- utility ---------------------------
 
+    def _collect_thinking_blocks(self, content: Any) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for block in content or []:
+            t = self._safe_attr(block, "type")
+            if t in ("thinking", "redacted_thinking"):
+                if isinstance(block, dict):
+                    out.append(block)
+                elif hasattr(block, "model_dump"):
+                    out.append(block.model_dump())
+                elif hasattr(block, "__dict__"):
+                    out.append({k: getattr(block, k) for k in block.__dict__.keys()})
+                else:
+                    out.append({"type": t, "raw": str(block)})
+        return out
+
+    def _join_thinking_text(self, blocks: List[Dict[str, Any]]) -> str:
+        parts: List[str] = []
+        for b in blocks:
+            if b.get("type") == "thinking":
+                txt = b.get("thinking") or b.get("text") or b.get("content")
+                if txt:
+                    parts.append(str(txt))
+        return "\n".join(parts)
+
+    def _append_user_message(self, blocks: List[Dict[str, Any]]):
+        self._messages.append({"role": "user", "content": blocks})
+
+    def _append_assistant_message(self, blocks: Any):
+        self._messages.append({"role": "assistant", "content": blocks})
+
+    def _safe_attr(self, obj: Any, name: str, default: Any = None) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(name, default)
+        return getattr(obj, name, default)
+
     def _serialize_object(self, obj: Any) -> Any:
-        """
-        Safely serialize unknown SDK objects for JSON trajectory storage.
-        """
         if obj is None:
             return None
         elif isinstance(obj, (str, int, float, bool)):
@@ -619,9 +656,9 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans
             return [self._serialize_object(item) for item in obj]
         elif isinstance(obj, dict):
             return {k: self._serialize_object(v) for k, v in obj.items()}
-        elif hasattr(obj, '__dict__'):
+        elif hasattr(obj, "__dict__"):
             return {k: self._serialize_object(v) for k, v in obj.__dict__.items()}
-        elif hasattr(obj, 'model_dump'):
+        elif hasattr(obj, "model_dump"):
             return obj.model_dump()
         else:
             return str(obj)
@@ -630,7 +667,6 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans
         if not getattr(self, "_enable_logging", False):
             return
         try:
-            # Build a sanitized event for logging (exclude raw screenshots)
             step = step_data.get("step")
             
             reasoning = step_data.get("reasoning")
@@ -639,16 +675,13 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans
             action_taken = step_data.get("action_taken")
 
             lines: List[str] = []
-            # Header is provided by logger formatter; include step number in message header line
             lines.append(f"Step {step}")
             lines.append("------------------------")
             lines.append("Reasoning:")
             lines.append(reasoning or "None")
-            # For OpenAI CUA: include Text Output section only if we actually have assistant text
-            if assistant_text:
-                lines.append("------------------------")
-                lines.append("Text Output:")
-                lines.append(assistant_text)
+            lines.append("------------------------")
+            lines.append("Text Output:")
+            lines.append(assistant_text or "None")
             lines.append("------------------------")
             lines.append("Computer Tool Call:")
             lines.append(json.dumps(tool_call_raw, indent=2, ensure_ascii=False) if tool_call_raw is not None else "None")
@@ -659,5 +692,4 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans
 
             self.logger.info("\n".join(lines))
         except Exception:
-            # Never allow logging to break control flow
             pass

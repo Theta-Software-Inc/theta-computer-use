@@ -7,7 +7,7 @@ async def make_request(
     api_key: Optional[str] = None, 
     data: Optional[Any] = None,
     params: Optional[Dict[str, Any]] = None,
-    timeout: float = 300.0
+    timeout: float = 600.0
 ) -> Any:
     """
     Make a request to the Theta Computer Use Environments API
