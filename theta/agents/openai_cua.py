@@ -83,7 +83,8 @@ class OpenAIAgent:
         self._system_prompt = (
             "You are a computer-use agent. Do not ask questions or wait for clarification. "
             "Use the computer tool autonomously until the task is complete. "
-            "If you finish or cannot proceed further, end your response with 'done' or 'fail' without issuing a computer_call."
+            "If you finish or cannot proceed further, end your response with 'done' or 'fail' without issuing another computer call. "
+            "If the request includes any files (e.g. PDFs), treat them as provided materials and consult them directly to complete the task instead of asking the user for attachments or summaries."
         )
 
         self._tools = [{
@@ -97,7 +98,33 @@ class OpenAIAgent:
         # Ask the API to include a concise reasoning summary where available
         self._reasoning = {"summary": "auto"}
 
+        # Materials (PDFs) to attach on the first request, as Responses 'input_file' parts
+        self._materials_segments: List[Dict[str, Any]] = []
+
     # --------------------------- public API ---------------------------
+
+    def set_materials(self, materials: Dict[str, str]) -> None:
+        """
+        Accepts dict[str, str]: {filename: raw_base64_pdf}
+        Converts to Responses 'input_file' parts (data URL) and stores them
+        to be attached on the *first* request only.
+        (No base64 validation / extra logging; we normalize data URLs if present.)
+        """
+        self._materials_segments = []
+        if not isinstance(materials, dict):
+            return
+        for filename, raw in materials.items():
+            s = (raw or "").strip()
+            if not s:
+                continue
+            # If a data URL slipped in, reduce to raw base64 to avoid double prefixing
+            if s.startswith("data:") and "base64," in s:
+                s = s.split("base64,", 1)[1]
+            self._materials_segments.append({
+                "type": "input_file",
+                "filename": filename,
+                "file_data": f"data:application/pdf;base64,{s}",
+            })
 
     async def act(self, obs: Observation) -> tuple[Optional[Action], bool]:
         """
@@ -140,10 +167,32 @@ class OpenAIAgent:
         for attempt in range(12):
             inputs: List[Dict[str, Any]] = []
 
-            # First turn: send the instruction as a user message
+            # First turn: send instruction + (optional) PDFs + (optional) initial screenshot
             if self._prev_response_id is None:
-                user_content = obs.text or "Complete the task on screen."
-                inputs.append({"type": "message", "role": "user", "content": user_content})
+                has_materials = bool(self._materials_segments)
+                default_text = (
+                    "Use the attached PDF(s) and the on-screen image to complete the task instructions."
+                    if has_materials else
+                    "Use the on-screen image to complete the task instructions."
+                )
+                user_content = obs.text or default_text
+
+                # Build a structured content message
+                parts: List[Dict[str, Any]] = []
+                if has_materials:
+                    parts.extend(self._materials_segments)
+                if scaled.screenshot:
+                    parts.append({
+                        "type": "input_image",
+                        "image_url": f"data:image/png;base64,{scaled.screenshot}",
+                    })
+                parts.append({"type": "input_text", "text": user_content})
+
+                inputs.append({
+                    "type": "message",
+                    "role": "user",
+                    "content": parts,
+                })
 
             # If we owe a screenshot from a prior computer_call, send it now
             elif self._pending_call_id:
@@ -158,7 +207,6 @@ class OpenAIAgent:
                     "call_id": self._pending_call_id,
                     "output": {
                         "type": "input_image",
-                        # OpenAI supports data URLs for image_url
                         "image_url": f"data:image/png;base64,{scaled.screenshot}",
                     },
                 }
@@ -198,7 +246,6 @@ class OpenAIAgent:
             reasoning_text = None
             if hasattr(resp, 'reasoning') and resp.reasoning:
                 try:
-                    # 'summary' may be a list of segments with a .text field
                     summ = getattr(resp.reasoning, "summary", None)
                     if isinstance(summ, list) and summ:
                         maybe = getattr(summ[0], "text", None) or getattr(summ[0], "content", None)
@@ -208,7 +255,6 @@ class OpenAIAgent:
                     pass
 
             if not reasoning_text and rblocks:
-                # fallback: find a 'text'/'content' within blocks
                 for rb in rblocks:
                     if isinstance(rb, dict):
                         text = rb.get("text") or rb.get("content")
@@ -424,6 +470,15 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans
       <div>
         <h3>📸 Screenshot</h3>
         <img src="{screenshot_path}" alt="Step {step_num} screenshot" class="screenshot">
+      </div>
+"""
+
+            # Observation text (initial task instructions or subsequent text observation)
+            obs_text = observation.get('text') or "No text observation available"
+            html_content += f"""
+      <div>
+        <h3>Observation Text:</h3>
+        <p>{obs_text}</p>
       </div>
 """
 

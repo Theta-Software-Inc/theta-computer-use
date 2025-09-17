@@ -5,7 +5,7 @@ import asyncio
 
 
 async def main():
-    tasks = ["accounting-dilution", "simulate-refund"]
+    tasks = ["accounting-dilution", "simulate-refund"] 
     await run_multiple_tasks(tasks, session_name="default", openai_agent=True, max_steps=10)
 
 async def run_agent_loop(env, agent, max_steps: int):

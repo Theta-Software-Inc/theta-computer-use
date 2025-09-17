@@ -52,7 +52,7 @@ class ClaudeAgent:
         self,
         name: str,
         api_key: str,
-        model: str = "claude-4-sonnet-20250514",
+        model: str = "claude-sonnet-4-20250514",
         screen_size: tuple[int, int] = (1024, 768),
         *,
         tool_version: str = "20250124",
@@ -82,7 +82,8 @@ class ClaudeAgent:
         self._system_prompt = (
             "You are a computer-use agent. Do not ask questions or wait for clarification. "
             "Use the computer tool autonomously until the task is complete. "
-            "If you finish or cannot proceed further, end your response with 'done' or 'fail' without requesting more tools."
+            "If you finish or cannot proceed further, end your response with 'done' or 'fail' without requesting more tools. "
+            "If the request includes any 'document' blocks (e.g. PDFs), treat them as provided materials and consult them directly to complete the taskinstead of asking the user for attachments or summaries."
         )
 
         self._messages: List[Dict[str, Any]] = []
@@ -105,7 +106,35 @@ class ClaudeAgent:
                 self.logger.addHandler(_h)
             self.logger.propagate = False
 
+        # Materials (PDFs) to attach on the first request as Messages 'document' blocks
+        self._materials_blocks: List[Dict[str, Any]] = []
+        self._materials_names: List[str] = []
+
     # --------------------------- public API ---------------------------
+
+    def set_materials(self, materials: Dict[str, str]) -> None:
+        """
+        Accepts dict[str, str]: {filename: raw_base64_pdf}
+        Converts to Anthropic 'document' blocks to be attached on the first request only.
+        Assumes values are valid base64 (optionally prefixed with a data URL).
+        """
+        self._materials_blocks = []
+        if not isinstance(materials, dict) or not materials:
+            return
+
+        for filename, raw in materials.items():
+            s = str(raw or "").strip()
+            if not s:
+                continue
+            # Normalize an optional data URL to raw base64
+            if s.startswith("data:") and "base64," in s:
+                s = s.split("base64,", 1)[1]
+
+            self._materials_blocks.append({
+                "type": "document",
+                "title": filename or "material.pdf",
+                "source": {"type": "base64", "media_type": "application/pdf", "data": s},
+            })
 
     async def act(self, obs: Observation) -> tuple[Optional[Action], bool]:
         """
@@ -158,17 +187,25 @@ class ClaudeAgent:
                 self._pending_tool_use_id = None
                 self._pending_action_name = None
 
-            # First turn: send the initial screenshot + instruction
+            # First turn: send the initial screenshot + instruction + materials
             if not self._messages:
-                user_text = obs.text or "Complete the task on screen."
-                # Use an image block plus text block, mirroring the quickstarts
-                init_blocks = []
+                has_materials = bool(self._materials_blocks)
+                default_text = (
+                    "Use the attached PDF(s) and the on-screen image to complete the task instructions."
+                    if has_materials else
+                    "Use the on-screen image to complete the task instructions."
+                )
+                user_content = obs.text or default_text
+
+                init_blocks: List[Dict[str, Any]] = []
+                if has_materials:
+                    init_blocks.extend(self._materials_blocks)
                 if scaled.screenshot:
                     init_blocks.append({
                         "type": "image",
                         "source": {"type": "base64", "media_type": "image/png", "data": scaled.screenshot}
                     })
-                init_blocks.append({"type": "text", "text": user_text})
+                init_blocks.append({"type": "text", "text": user_content})
                 self._append_user_message(init_blocks)
 
             params: Dict[str, Any] = {
@@ -254,6 +291,7 @@ class ClaudeAgent:
         self._trajectory.append(step_data)
         self._log_step(step_data)
         return None, True
+
 
     def trajectory_json(self, output_dir: str = "trajectories", save_images: bool = True, eval_score: Optional[float] = None) -> str:
         if not os.path.exists(output_dir):
@@ -391,6 +429,15 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans
       <div>
         <h3>📸 Screenshot</h3>
         <img src="{screenshot_path}" alt="Step {step_num} screenshot" class="screenshot">
+      </div>
+"""
+
+            # Observation text (initial task instructions or subsequent text observation)
+            obs_text = observation.get('text') or "No text observation available"
+            html_content += f"""
+      <div>
+        <h3>Observation Text:</h3>
+        <p>{obs_text}</p>
       </div>
 """
 

@@ -65,7 +65,8 @@ class Session:
                 session=env_data["session"],
                 task_id=env_data["task_id"],
                 status=EnvStatus(env_data["status"]),
-                current_obs=Observation(**env_data["current_obs"]) if env_data.get("current_obs") else None
+                current_obs=Observation(**env_data["current_obs"]) if env_data.get("current_obs") else None,
+                materials=env_data["materials"] if env_data.get("materials") else None
             )
             self.envs.append(environment)
             created_environments.append(environment)

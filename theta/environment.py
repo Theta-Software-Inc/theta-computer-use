@@ -16,6 +16,7 @@ class Environment:
         task_id: str,
         status: EnvStatus,
         current_obs: Optional[Observation] = None,
+        materials: Optional[dict[str, str]] = None,
         vnc_url: Optional[str] = None
     ) -> None:
         """
@@ -27,6 +28,7 @@ class Environment:
             task_id: The task ID for this environment
             status: The environment status
             current_obs: The current observation
+            materials: Any PDF materials for the environment
             vnc_url: The VNC URL for the environment
         """
         self.env_id = env_id
@@ -34,6 +36,7 @@ class Environment:
         self.task_id = task_id
         self.status = status
         self.current_obs = current_obs
+        self.materials = materials
         self.vnc_url = vnc_url
 
     async def step(self, action: Action) -> tuple[Observation, float, bool, dict]:

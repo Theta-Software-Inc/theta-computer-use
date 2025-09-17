@@ -1,6 +1,6 @@
 [project]
 name = "theta-sdk"
-version = "0.1.0"
+version = "0.1.1"
 description = "Theta Testing Engine SDK"
 readme = "README.md"
 license = {file = "LICENSE"}
@@ -24,8 +24,8 @@ examples = [
 ]
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
 
-[tool.hatch.build.targets.wheel]
-packages = ["theta"]
+[tool.setuptools.packages.find]
+include = ["theta", "theta.*"]

@@ -38,6 +38,9 @@ async def run_single_task(task_id, session_name="default", openai_agent=True, ma
         )
 
     print("Starting agent loop...")
+    if env.materials:
+        print("Setting materials...")
+        agent.set_materials(env.materials)
     obs = env.current_obs
     for _ in range(max_steps):
         action, done = await agent.act(obs)
